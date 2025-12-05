@@ -34,7 +34,7 @@ mkdir -p checkpoints
 
 # 8. Download Weights (Manually for testing)
 # MatFuse
-wget -O checkpoints/matfuse_f8.ckpt "https://huggingface.co/gvecchio/MatFuse/resolve/main/matfuse_f8.ckpt?download=true"
+wget -O checkpoints/matfuse_f8.ckpt "https://huggingface.co/gvecchio/MatFuse/resolve/main/matfuse-full.ckpt?download=true"
 # Real-ESRGAN
 wget -O checkpoints/RealESRGAN_x4plus.pth "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 
