@@ -123,7 +123,7 @@ def handler(job):
     # --- Conditioning Logic ---
     # MatFuse handles multimodal conditioning.
     # 1. Text Conditioning
-    c_list =
+    c_list = []
     if prompt:
         c_list.append(MATFUSE_MODEL.get_learned_conditioning([prompt]))
     else:
@@ -210,7 +210,7 @@ def handler(job):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Local Test for MatFuse Handler")
-    parser.add_argument("--prompt", type=str, default="old rusty metal", help="Text prompt")
+    parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
     parser.add_argument("--image", type=str, default=None, help="Path to local image file")
     parser.add_argument("--res", type=int, default=1024, help="Target Resolution")
     args = parser.parse_args()
