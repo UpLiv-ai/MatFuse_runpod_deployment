@@ -32,11 +32,11 @@ MATFUSE_MODEL = None
 UPSCALE_MODEL = None
 
 # Paths
-CONFIG_PATH = os.path.join(SRC_DIR, "configs/diffusion/matfuse_ldm_vq_f8.yaml")
+CONFIG_PATH = os.path.join(SRC_DIR, "configs/diffusion/matfuse-ldm-vq_f8.yaml")
 # We stick with v0.1.0 (x4plus) because v0.3.0 (general-x4v3) is a tiny model for video, 
 # which lacks the fine texture detail generation needed for PBR.
-CKPT_PATH = os.path.join(ROOT_DIR, "checkpoints/matfuse_f8.ckpt")
-UPSCALER_PATH = os.path.join(ROOT_DIR, "checkpoints/RealESRGAN_x4plus.pth")
+CKPT_PATH = os.path.join(ROOT_DIR, "matfuse-sd", "checkpoints/matfuse_f8.ckpt")
+UPSCALER_PATH = os.path.join(ROOT_DIR, "matfuse-sd", "checkpoints/RealESRGAN_x4plus.pth")
 
 def load_models():
     global MATFUSE_MODEL, UPSCALE_MODEL
@@ -123,70 +123,101 @@ def handler(job):
     # --- Conditioning Logic ---
     # MatFuse handles multimodal conditioning.
     # 1. Text Conditioning
-    c_list = []
-    if prompt:
-        c_list.append(MATFUSE_MODEL.get_learned_conditioning([prompt]))
-    else:
-        # Empty text conditioning if no prompt provided
-        c_list.append(MATFUSE_MODEL.get_learned_conditioning([""]))
+    conditioning_inputs = {}
 
-    # 2. Image Conditioning (if provided)
-    # Note: MatFuse typically expects specific encoders for images.
-    # Standard LDM uses CLIP Image Encoder for "style" or "variation".
+    # 1. Process Image Inputs (Style, Structure, and Palette)
     if input_image_b64:
         print("Processing Image Input...")
         cond_img = process_input_image(input_image_b64)
         if cond_img:
-            # Preprocess image for the model (ToTensor + Normalize)
-            # MatFuse uses a specific helper 'get_input' usually, but here we construct the tensor manually
-            # to avoid dependency on dataset loaders.
+            # A. Image Embed (Style) -> RGB Tensor [1, 3, 512, 512]
             img_tensor = torch.from_numpy(np.array(cond_img)).float() / 127.5 - 1.0
             img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+            conditioning_inputs["image_embed"] = img_tensor
             
-            # Encode image using the model's condition encoder
-            # We assume the model has a method to encode images, typically 'get_learned_conditioning'
-            # handles dictionary inputs in advanced LDMs, but for standard CLIP image conditioning:
-            try:
-                c_img = MATFUSE_MODEL.get_learned_conditioning({"image": img_tensor}) 
-                # Note: If this fails, it might be because the specific MatFuse config expects 
-                # a different key or direct tensor. Fallback to simple concatenation if supported.
-                if isinstance(c_img, list): c_list.extend(c_img)
-                else: c_list.append(c_img)
-            except:
-                print("Warning: Could not encode image conditioning. Ignoring image.")
+            # B. Sketch (Structure) -> Grayscale Tensor [1, 1, 512, 512]
+            # Take mean across channels to convert RGB to Grayscale
+            sketch_tensor = img_tensor.mean(dim=1, keepdim=True)
+            conditioning_inputs["sketch"] = sketch_tensor
 
-    # Combine conditions (Simplified: usually just taking the first valid one or averaging)
-    # For this handler, we default to the text conditioning primarily.
-    c = c_list 
+            # C. Palette (Color) -> Color Vector [1, 5, 3]
+            # Resize image to 5x1 to extract 5 dominant colors
+            palette_img = cond_img.resize((5, 1), Image.Resampling.BICUBIC)
+            palette_arr = np.array(palette_img) # Shape becomes (1, 5, 3)
+            # Normalize to [-1, 1] range
+            palette_tensor = torch.from_numpy(palette_arr).float() / 127.5 - 1.0
+            conditioning_inputs["palette"] = palette_tensor.to(DEVICE)
 
+    else:
+        print("Warning: No image provided. Using blank defaults.")
+        # Create blank tensors to prevent crash
+        conditioning_inputs["image_embed"] = torch.zeros((1, 3, 512, 512)).to(DEVICE)
+        conditioning_inputs["sketch"] = torch.zeros((1, 1, 512, 512)).to(DEVICE)
+        conditioning_inputs["palette"] = torch.zeros((1, 5, 3)).to(DEVICE)
+
+    # 2. Process Text
+    # We pass the prompt under the "text" key (standard for these models)
+    conditioning_inputs["text"] = [prompt] if prompt else [""]
+
+    # 3. Get Combined Conditioning (Call ONLY once)
+    c = MATFUSE_MODEL.get_learned_conditioning(conditioning_inputs)
+
+    # 4. Unconditional Conditioning (for Classifier-Free Guidance)
     uc = None
-    if cfg!= 1.0:
-        uc = MATFUSE_MODEL.get_learned_conditioning([neg_prompt])
+    if cfg != 1.0:
+        # For UCF, we usually keep the image conditioning but empty the text
+        uc_inputs = conditioning_inputs.copy()
+        uc_inputs["text"] = [""] * len(conditioning_inputs["text"])
+        uc = MATFUSE_MODEL.get_learned_conditioning(uc_inputs)
         
-    shape = [4, 512 // 8, 512 // 8]
+    # --- 5. Sampling ---
+    shape = [12, 512 // 8, 512 // 8]
     sampler = DDIMSampler(MATFUSE_MODEL)
     
     print(f"Generating with Seed: {seed}")
     
+    # Step A: Run Sampling in FP16 (Fast & Efficient)
     with torch.inference_mode(), torch.autocast(DEVICE):
         samples, _ = sampler.sample(S=steps, conditioning=c, batch_size=1, shape=shape, 
                                     verbose=False, unconditional_guidance_scale=cfg, 
                                     unconditional_conditioning=uc, eta=0.0)
+
+    # Step B: Run Decoding in FP32 (Precise & Stable)
+    # FIX: We exit the 'autocast' block above. The Decoder fails in FP16 (produces black images).
+    with torch.inference_mode():
+        print("Decoding in Float32...")
         
+        # 1. Ensure samples are Float32
+        samples = samples.to(dtype=torch.float32)
+        
+        # 2. Decode using the built-in method (handles scaling automatically)
         x_samples = MATFUSE_MODEL.decode_first_stage(samples)
+        
+        # 3. Clamp and Normalize
         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
         
-        grid = x_samples.cpu().numpy().transpose(1, 2, 0)
-        grid = (grid * 255).astype(np.uint8)
+        # 4. Convert to Numpy -> (Height, Width, 9)
+        grid = x_samples.cpu().numpy().transpose(0, 2, 3, 1)[0]
         
-    # Split Maps
-    h, w, _ = grid.shape
-    single_w = w // 4
+        # 5. Slice the 9-channel image into 3 separate RGB images
+        diffuse_np = (grid[:, :, 0:3] * 255).astype(np.uint8)
+        normal_np  = (grid[:, :, 3:6] * 255).astype(np.uint8)
+        packed_np  = (grid[:, :, 6:9] * 255).astype(np.uint8)
+
+    # --- 7. Processing Maps ---
+    # Extract Roughness and Specular from the packed image
+    roughness_np = packed_np[:, :, 0]
+    specular_np  = packed_np[:, :, 1]
+    
+    # Stack them back into 3-channel images
+    roughness_np = np.stack([roughness_np]*3, axis=-1)
+    specular_np  = np.stack([specular_np]*3, axis=-1)
+
     maps = {
-        "diffuse": grid[:, 0:single_w, :],
-        "normal": grid[:, single_w:single_w*2, :],
-        "roughness": grid[:, single_w*2:single_w*3, :],
-        "specular": grid[:, single_w*3:, :]
+        "diffuse": diffuse_np,
+        "normal": normal_np,
+        "roughness": roughness_np,
+        "specular": specular_np
     }
     
     # Upscale
